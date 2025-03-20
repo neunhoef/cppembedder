@@ -68,15 +68,6 @@ impl Embedder {
 
         for entry in entries {
             let file_path = entry.path();
-            let file_name = file_path.file_name().unwrap().to_string_lossy().to_string();
-
-            // Skip _index.txt files
-            if file_name.contains("_index.txt") {
-                continue;
-            }
-            if file_name.ends_with(".embedding.json") {
-                continue;
-            }
 
             // Read the file content
             let content = fs::read_to_string(&file_path)?;

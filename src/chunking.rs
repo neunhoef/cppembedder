@@ -2,7 +2,7 @@ use serde::Deserialize;
 use serde_json::json;
 use std::error::Error;
 use std::fs::{self, File};
-use std::io::{BufReader, Write, BufRead, Read};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use walkdir::WalkDir;
@@ -51,23 +51,195 @@ pub struct Chunker {
     project_dir: String,
     output_dir: String,
     clangd_path: String,
+    lsp_log_file: String,
 }
 
 impl Chunker {
-    pub fn new(project_dir: String, output_dir: String, clangd_path: String) -> Self {
+    pub fn new(project_dir: String, output_dir: String, clangd_path: String, lsp_log_file: String) -> Self {
         Self {
             project_dir,
             output_dir,
             clangd_path,
+            lsp_log_file,
         }
+    }
+
+    fn find_cpp_source_files(&self) -> Result<Vec<PathBuf>, Box<dyn Error>> {
+        let mut cpp_files = Vec::new();
+
+        for entry in WalkDir::new(&self.project_dir) {
+            let entry = entry.map_err(|e| format!("Failed to read directory entry in '{}': {}", self.project_dir, e))?;
+            let path = entry.path();
+
+            if path.is_file() {
+                if let Some(extension) = path.extension() {
+                    let ext = extension.to_string_lossy().to_lowercase();
+                    if ext == "cpp"
+                        || ext == "cxx"
+                        || ext == "cc"
+                        || ext == "h"
+                        || ext == "hpp"
+                        || ext == "hxx"
+                    {
+                        cpp_files.push(path.to_path_buf());
+                    }
+                }
+            }
+        }
+
+        Ok(cpp_files)
+    }
+
+    fn extract_chunks(
+        &self,
+        _file_path: &Path,
+        file_content: &str,
+        symbols: &[Symbol],
+    ) -> Result<Vec<CodeChunk>, Box<dyn Error>> {
+        let mut chunks = Vec::new();
+        let lines: Vec<&str> = file_content.lines().collect();
+
+        // Helper function to process symbols recursively
+        fn process_symbols(
+            symbols: &[Symbol],
+            lines: &[&str],
+            chunks: &mut Vec<CodeChunk>,
+            parent: Option<&str>,
+        ) {
+            for symbol in symbols {
+                let kind = match symbol.kind {
+                    SYMBOL_KIND_FUNCTION => "function",
+                    SYMBOL_KIND_METHOD => "method",
+                    SYMBOL_KIND_CLASS => "class",
+                    SYMBOL_KIND_NAMESPACE => "namespace",
+                    _ => continue, // Skip other symbols like variables
+                };
+
+                let start_line = symbol.range.start.line;
+                let end_line = symbol.range.end.line;
+
+                // Skip if the range is invalid or too small
+                if start_line >= end_line || end_line >= lines.len() {
+                    continue;
+                }
+
+                // Extract the content of the chunk
+                let content = lines[start_line..=end_line].join("\n");
+
+                // Create a unique name for the chunk
+                let chunk_name = if let Some(parent_name) = parent {
+                    format!("{}::{}", parent_name, symbol.name)
+                } else {
+                    symbol.name.clone()
+                };
+
+                chunks.push(CodeChunk {
+                    name: chunk_name.clone(),
+                    content,
+                    start_line,
+                    end_line,
+                    kind: kind.to_string(),
+                    parent: parent.map(|s| s.to_string()),
+                });
+
+                // Process child symbols (like methods within a class)
+                process_symbols(&symbol.children, lines, chunks, Some(&chunk_name));
+            }
+        }
+
+        process_symbols(symbols, &lines, &mut chunks, None);
+        Ok(chunks)
+    }
+
+    fn write_chunks(
+        &self,
+        source_file: &Path,
+        chunks: &[CodeChunk],
+    ) -> Result<(), Box<dyn Error>> {
+        // Create a directory for this file's chunks
+        let file_stem = source_file
+            .file_stem()
+            .unwrap_or_default()
+            .to_string_lossy();
+        let file_chunks_dir = PathBuf::from(&self.output_dir).join(file_stem.to_string());
+        fs::create_dir_all(&file_chunks_dir)
+            .map_err(|e| format!("Failed to create chunks directory '{}': {}", file_chunks_dir.display(), e))?;
+
+        // Write index file with metadata about all chunks
+        let mut index = File::create(file_chunks_dir.join("_index.txt"))
+            .map_err(|e| format!("Failed to create index file in '{}': {}", file_chunks_dir.display(), e))?;
+
+        writeln!(index, "Source file: {}", source_file.display())
+            .map_err(|e| format!("Failed to write to index file: {}", e))?;
+        writeln!(index, "Number of chunks: {}", chunks.len())
+            .map_err(|e| format!("Failed to write to index file: {}", e))?;
+        writeln!(index, "---")
+            .map_err(|e| format!("Failed to write to index file: {}", e))?;
+
+        // Write each chunk to a separate file
+        for (i, chunk) in chunks.iter().enumerate() {
+            let mut sanitized_name = chunk
+                .name
+                .replace("::", "_")
+                .replace("<", "_")
+                .replace(">", "_");
+            if sanitized_name.len() > 200 {
+                sanitized_name = sanitized_name[..200].to_string();
+            }
+            let chunk_filename = format!(
+                "{:03}_{}_{}_{}.cpp",
+                i + 1,
+                sanitized_name,
+                chunk.kind,
+                chunk.start_line + 1
+            );
+
+            let chunk_path = file_chunks_dir.join(chunk_filename.clone());
+            fs::write(&chunk_path, &chunk.content)
+                .map_err(|e| format!("Failed to write chunk file '{}': {}", chunk_path.display(), e))?;
+
+            // Add to index
+            writeln!(index, "Chunk: {}", chunk_filename)
+                .map_err(|e| format!("Failed to write to index file: {}", e))?;
+            writeln!(index, "  Name: {}", chunk.name)
+                .map_err(|e| format!("Failed to write to index file: {}", e))?;
+            writeln!(index, "  Kind: {}", chunk.kind)
+                .map_err(|e| format!("Failed to write to index file: {}", e))?;
+            writeln!(
+                index,
+                "  Lines: {}-{}",
+                chunk.start_line + 1,
+                chunk.end_line + 1
+            )
+            .map_err(|e| format!("Failed to write to index file: {}", e))?;
+            if let Some(parent) = &chunk.parent {
+                writeln!(index, "  Parent: {}", parent)
+                    .map_err(|e| format!("Failed to write to index file: {}", e))?;
+            }
+            writeln!(index, "---")
+                .map_err(|e| format!("Failed to write to index file: {}", e))?;
+        }
+
+        println!(
+            "Wrote {} chunks for {}",
+            chunks.len(),
+            source_file.display()
+        );
+        Ok(())
     }
 
     pub fn run(&self) -> Result<(), Box<dyn Error>> {
         // Create output directory if it doesn't exist
-        fs::create_dir_all(&self.output_dir)?;
+        fs::create_dir_all(&self.output_dir)
+            .map_err(|e| format!("Failed to create output directory '{}': {}", self.output_dir, e))?;
+
+        // Open LSP log file
+        let mut _lsp_log = File::create(&self.lsp_log_file)
+            .map_err(|e| format!("Failed to create LSP log file '{}': {}", self.lsp_log_file, e))?;
 
         // Find all C++ source files in the project
-        let source_files = find_cpp_source_files(&self.project_dir)?;
+        let source_files = self.find_cpp_source_files()
+            .map_err(|e| format!("Failed to scan project directory '{}': {}", self.project_dir, e))?;
         println!("Found {} C++ source files", source_files.len());
 
         // Start clangd process
@@ -76,7 +248,8 @@ impl Chunker {
             .arg("--log=verbose")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .spawn()?;
+            .spawn()
+            .map_err(|e| format!("Failed to start clangd process at '{}': {}", self.clangd_path, e))?;
 
         let mut clangd_stdin = clangd.stdin.take().expect("Failed to open clangd stdin");
         let mut clangd_stdout =
@@ -89,7 +262,9 @@ impl Chunker {
             "method": "initialize",
             "params": {
                 "processId": std::process::id(),
-                "rootUri": format!("file://{}", fs::canonicalize(&self.project_dir)?.to_string_lossy()),
+                "rootUri": format!("file://{}", fs::canonicalize(&self.project_dir)
+                    .map_err(|e| format!("Failed to canonicalize project path '{}': {}", self.project_dir, e))?
+                    .to_string_lossy()),
                 "capabilities": {
                     "textDocument": {
                         "documentSymbol": {
@@ -100,17 +275,18 @@ impl Chunker {
             }
         });
 
-        send_lsp_request(&mut clangd_stdin, initialize_request)?;
+        self.send_lsp_request(&mut clangd_stdin, initialize_request)
+            .map_err(|e| format!("Failed to send LSP initialization request: {}", e))?;
 
         // Process all source files
         for source_file in source_files {
             println!("Processing file: {}", source_file.display());
-            process_file(
+            self.process_file(
                 &source_file,
-                &self.output_dir,
                 &mut clangd_stdin,
                 &mut clangd_stdout,
-            )?;
+            )
+            .map_err(|e| format!("Failed to process file '{}': {}", source_file.display(), e))?;
         }
 
         // Shutdown clangd
@@ -120,7 +296,8 @@ impl Chunker {
             "method": "shutdown",
             "params": null
         });
-        send_lsp_request(&mut clangd_stdin, shutdown_request)?;
+        self.send_lsp_request(&mut clangd_stdin, shutdown_request)
+            .map_err(|e| format!("Failed to send LSP shutdown request: {}", e))?;
 
         // Exit clangd
         let exit_notification = json!({
@@ -128,278 +305,176 @@ impl Chunker {
             "method": "exit",
             "params": null
         });
-        send_lsp_request(&mut clangd_stdin, exit_notification)?;
+        self.send_lsp_request(&mut clangd_stdin, exit_notification)
+            .map_err(|e| format!("Failed to send LSP exit notification: {}", e))?;
 
         Ok(())
     }
-}
 
-fn find_cpp_source_files(project_dir: &str) -> Result<Vec<PathBuf>, Box<dyn Error>> {
-    let mut cpp_files = Vec::new();
+    fn send_lsp_request(
+        &self,
+        stdin: &mut std::process::ChildStdin,
+        request: serde_json::Value,
+    ) -> Result<(), Box<dyn Error>> {
+        let request_str = serde_json::to_string(&request)
+            .map_err(|e| format!("Failed to serialize LSP request: {}", e))?;
+        let content_length = request_str.len();
 
-    for entry in WalkDir::new(project_dir) {
-        let entry = entry?;
-        let path = entry.path();
+        // Create log entry for request
+        let log_entry = format!(">>> Request:\nContent-Length: {}\n\n{}\n", content_length, request_str);
+        if let Ok(mut lsp_log) = File::options().append(true).open(&self.lsp_log_file) {
+            write!(lsp_log, "{}", log_entry)
+                .map_err(|e| format!("Failed to write to LSP log file: {}", e))?;
+        }
 
-        if path.is_file() {
-            if let Some(extension) = path.extension() {
-                let ext = extension.to_string_lossy().to_lowercase();
-                if ext == "cpp"
-                    || ext == "cxx"
-                    || ext == "cc"
-                    || ext == "h"
-                    || ext == "hpp"
-                    || ext == "hxx"
-                {
-                    cpp_files.push(path.to_path_buf());
+        writeln!(stdin, "Content-Length: {}", content_length)
+            .map_err(|e| format!("Failed to write Content-Length header: {}", e))?;
+        writeln!(stdin)
+            .map_err(|e| format!("Failed to write header separator: {}", e))?;
+        write!(stdin, "{}", request_str)
+            .map_err(|e| format!("Failed to write request body: {}", e))?;
+        stdin.flush()
+            .map_err(|e| format!("Failed to flush request: {}", e))?;
+
+        Ok(())
+    }
+
+    fn read_lsp_response(
+        &self,
+        reader: &mut BufReader<std::process::ChildStdout>,
+    ) -> Result<serde_json::Value, Box<dyn Error>> {
+        // Read headers
+        let mut content_length: Option<usize> = None;
+        let mut headers = String::new();
+        loop {
+            let mut line = String::new();
+            reader.read_line(&mut line)
+                .map_err(|e| format!("Failed to read LSP response header: {}", e))?;
+            let line = line.trim();
+
+            headers.push_str(&line);
+            headers.push('\n');
+
+            if line.is_empty() {
+                break; // Headers are done
+            }
+
+            if line.starts_with("Content-Length:") {
+                let len_str = line
+                    .split(':')
+                    .nth(1)
+                    .ok_or("Invalid Content-Length header")?;
+                content_length = Some(len_str.trim().parse()
+                    .map_err(|e| format!("Failed to parse Content-Length value '{}': {}", len_str.trim(), e))?);
+            }
+        }
+
+        // Read content
+        if let Some(length) = content_length {
+            let mut buffer = vec![0; length];
+            reader.read_exact(&mut buffer)
+                .map_err(|e| format!("Failed to read LSP response body of length {}: {}", length, e))?;
+
+            let response_str = String::from_utf8_lossy(&buffer);
+            let json_value: serde_json::Value = serde_json::from_slice(&buffer)
+                .map_err(|e| format!("Failed to parse LSP response JSON: {}", e))?;
+
+            // Log the response
+            let log_entry = format!("<<< Response:\n{}{}\n", headers, response_str);
+            if let Ok(mut lsp_log) = File::options().append(true).open(&self.lsp_log_file) {
+                write!(lsp_log, "{}", log_entry)
+                    .map_err(|e| format!("Failed to write to LSP log file: {}", e))?;
+            }
+
+            Ok(json_value)
+        } else {
+            Err("No Content-Length header found".into())
+        }
+    }
+
+    fn process_file(
+        &self,
+        file_path: &Path,
+        clangd_stdin: &mut std::process::ChildStdin,
+        clangd_stdout: &mut BufReader<std::process::ChildStdout>,
+    ) -> Result<(), Box<dyn Error>> {
+        let file_content = fs::read_to_string(file_path)
+            .map_err(|e| format!("Failed to read file '{}': {}", file_path.display(), e))?;
+        let file_uri = format!("file://{}", fs::canonicalize(file_path)
+            .map_err(|e| format!("Failed to canonicalize path '{}': {}", file_path.display(), e))?
+            .to_string_lossy());
+
+        // Send didOpen notification to tell clangd about the file
+        let did_open_notification = json!({
+            "jsonrpc": "2.0",
+            "method": "textDocument/didOpen",
+            "params": {
+                "textDocument": {
+                    "uri": file_uri,
+                    "languageId": "cpp",
+                    "version": 1,
+                    "text": file_content
                 }
             }
-        }
-    }
+        });
+        self.send_lsp_request(clangd_stdin, did_open_notification)
+            .map_err(|e| format!("Failed to send didOpen notification for '{}': {}", file_path.display(), e))?;
 
-    Ok(cpp_files)
-}
-
-fn process_file(
-    file_path: &Path,
-    output_dir: &str,
-    clangd_stdin: &mut std::process::ChildStdin,
-    clangd_stdout: &mut BufReader<std::process::ChildStdout>,
-) -> Result<(), Box<dyn Error>> {
-    let file_content = fs::read_to_string(file_path)?;
-    let file_uri = format!("file://{}", fs::canonicalize(file_path)?.to_string_lossy());
-
-    // Send didOpen notification to tell clangd about the file
-    let did_open_notification = json!({
-        "jsonrpc": "2.0",
-        "method": "textDocument/didOpen",
-        "params": {
-            "textDocument": {
-                "uri": file_uri,
-                "languageId": "cpp",
-                "version": 1,
-                "text": file_content
+        // Send document symbol request to get the symbols in the file
+        let document_symbol_request = json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "textDocument/documentSymbol",
+            "params": {
+                "textDocument": {
+                    "uri": file_uri
+                }
             }
-        }
-    });
-    send_lsp_request(clangd_stdin, did_open_notification)?;
+        });
+        self.send_lsp_request(clangd_stdin, document_symbol_request)
+            .map_err(|e| format!("Failed to send document symbol request for '{}': {}", file_path.display(), e))?;
 
-    // Send document symbol request to get the symbols in the file
-    let document_symbol_request = json!({
-        "jsonrpc": "2.0",
-        "id": 2,
-        "method": "textDocument/documentSymbol",
-        "params": {
-            "textDocument": {
-                "uri": file_uri
-            }
-        }
-    });
-    send_lsp_request(clangd_stdin, document_symbol_request)?;
+        // Read and process clangd's response to extract symbols
+        let symbols = self.read_document_symbols(clangd_stdout)
+            .map_err(|e| format!("Failed to read document symbols for '{}': {}", file_path.display(), e))?;
 
-    // Read and process clangd's response to extract symbols
-    let symbols = read_document_symbols(clangd_stdout)?;
+        // Extract chunks from the file based on the symbols
+        let chunks = self.extract_chunks(file_path, &file_content, &symbols)
+            .map_err(|e| format!("Failed to extract chunks from '{}': {}", file_path.display(), e))?;
 
-    // Extract chunks from the file based on the symbols
-    let chunks = extract_chunks(&file_path, &file_content, &symbols)?;
+        // Write chunks to output files
+        self.write_chunks(file_path, &chunks)
+            .map_err(|e| format!("Failed to write chunks for '{}': {}", file_path.display(), e))?;
 
-    // Write chunks to output files
-    write_chunks(file_path, output_dir, &chunks)?;
-
-    Ok(())
-}
-
-fn send_lsp_request(
-    stdin: &mut std::process::ChildStdin,
-    request: serde_json::Value,
-) -> Result<(), Box<dyn Error>> {
-    let request_str = serde_json::to_string(&request)?;
-    let content_length = request_str.len();
-
-    writeln!(stdin, "Content-Length: {}", content_length)?;
-    writeln!(stdin)?;
-    write!(stdin, "{}", request_str)?;
-    stdin.flush()?;
-
-    Ok(())
-}
-
-fn read_lsp_response(
-    reader: &mut BufReader<std::process::ChildStdout>,
-) -> Result<serde_json::Value, Box<dyn Error>> {
-    // Read headers
-    let mut content_length: Option<usize> = None;
-    loop {
-        let mut line = String::new();
-        reader.read_line(&mut line)?;
-        let line = line.trim();
-
-        if line.is_empty() {
-            break; // Headers are done
-        }
-
-        if line.starts_with("Content-Length:") {
-            let len_str = line
-                .split(':')
-                .nth(1)
-                .ok_or("Invalid Content-Length header")?;
-            content_length = Some(len_str.trim().parse()?);
-        }
+        Ok(())
     }
 
-    // Read content
-    if let Some(length) = content_length {
-        let mut buffer = vec![0; length];
-        reader.read_exact(&mut buffer)?;
+    fn read_document_symbols(
+        &self,
+        stdout: &mut BufReader<std::process::ChildStdout>,
+    ) -> Result<Vec<Symbol>, Box<dyn Error>> {
+        // Keep reading responses until we get the document symbol response
+        loop {
+            let response = self.read_lsp_response(stdout)
+                .map_err(|e| format!("Failed to read LSP response while waiting for document symbols: {}", e))?;
 
-        let json_value: serde_json::Value = serde_json::from_slice(&buffer)?;
-        Ok(json_value)
-    } else {
-        Err("No Content-Length header found".into())
-    }
-}
-
-fn read_document_symbols(
-    stdout: &mut BufReader<std::process::ChildStdout>,
-) -> Result<Vec<Symbol>, Box<dyn Error>> {
-    // Keep reading responses until we get the document symbol response
-    loop {
-        let response = read_lsp_response(stdout)?;
-
-        // Check if this is the document symbol response (id: 2)
-        if let Some(id) = response.get("id") {
-            if id.as_u64() == Some(2) && response.get("result").is_some() {
-                return Ok(serde_json::from_value(response["result"].clone())?);
-            }
-        }
-
-        // For debugging
-        println!(
-            "Got response with id: {:?}, method: {:?}",
-            response.get("id"),
-            response.get("method")
-        );
-    }
-}
-
-fn extract_chunks(
-    _file_path: &Path,
-    file_content: &str,
-    symbols: &[Symbol],
-) -> Result<Vec<CodeChunk>, Box<dyn Error>> {
-    let mut chunks = Vec::new();
-    let lines: Vec<&str> = file_content.lines().collect();
-
-    // Helper function to process symbols recursively
-    fn process_symbols(
-        symbols: &[Symbol],
-        lines: &[&str],
-        chunks: &mut Vec<CodeChunk>,
-        parent: Option<&str>,
-    ) {
-        for symbol in symbols {
-            let kind = match symbol.kind {
-                SYMBOL_KIND_FUNCTION => "function",
-                SYMBOL_KIND_METHOD => "method",
-                SYMBOL_KIND_CLASS => "class",
-                SYMBOL_KIND_NAMESPACE => "namespace",
-                _ => continue, // Skip other symbols like variables
-            };
-
-            let start_line = symbol.range.start.line;
-            let end_line = symbol.range.end.line;
-
-            // Skip if the range is invalid or too small
-            if start_line >= end_line || end_line >= lines.len() {
-                continue;
+            // Check if this is the document symbol response (id: 2)
+            if let Some(id) = response.get("id") {
+                if id.as_u64() == Some(2) && response.get("result").is_some() {
+                    return serde_json::from_value(response["result"].clone())
+                        .map_err(|e| Box::new(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            format!("Failed to parse document symbols from response: {}", e)
+                        )) as Box<dyn Error>);
+                }
             }
 
-            // Extract the content of the chunk
-            let content = lines[start_line..=end_line].join("\n");
-
-            // Create a unique name for the chunk
-            let chunk_name = if let Some(parent_name) = parent {
-                format!("{}::{}", parent_name, symbol.name)
-            } else {
-                symbol.name.clone()
-            };
-
-            chunks.push(CodeChunk {
-                name: chunk_name.clone(),
-                content,
-                start_line,
-                end_line,
-                kind: kind.to_string(),
-                parent: parent.map(|s| s.to_string()),
-            });
-
-            // Process child symbols (like methods within a class)
-            process_symbols(&symbol.children, lines, chunks, Some(&chunk_name));
+            // For debugging
+            println!(
+                "Got response with id: {:?}, method: {:?}",
+                response.get("id"),
+                response.get("method")
+            );
         }
     }
-
-    process_symbols(symbols, &lines, &mut chunks, None);
-    Ok(chunks)
 }
-
-fn write_chunks(
-    source_file: &Path,
-    output_dir: &str,
-    chunks: &[CodeChunk],
-) -> Result<(), Box<dyn Error>> {
-    // Create a directory for this file's chunks
-    let file_stem = source_file
-        .file_stem()
-        .unwrap_or_default()
-        .to_string_lossy();
-    let file_chunks_dir = PathBuf::from(output_dir).join(file_stem.to_string());
-    fs::create_dir_all(&file_chunks_dir)?;
-
-    // Write index file with metadata about all chunks
-    let mut index = File::create(file_chunks_dir.join("_index.txt"))?;
-
-    writeln!(index, "Source file: {}", source_file.display())?;
-    writeln!(index, "Number of chunks: {}", chunks.len())?;
-    writeln!(index, "---")?;
-
-    // Write each chunk to a separate file
-    for (i, chunk) in chunks.iter().enumerate() {
-        let sanitized_name = chunk
-            .name
-            .replace("::", "_")
-            .replace("<", "_")
-            .replace(">", "_");
-        let chunk_filename = format!(
-            "{:03}_{}_{}_{}.cpp",
-            i + 1,
-            sanitized_name,
-            chunk.kind,
-            chunk.start_line + 1
-        );
-
-        let chunk_path = file_chunks_dir.join(chunk_filename.clone());
-        fs::write(&chunk_path, &chunk.content)?;
-
-        // Add to index
-        writeln!(index, "Chunk: {}", chunk_filename)?;
-        writeln!(index, "  Name: {}", chunk.name)?;
-        writeln!(index, "  Kind: {}", chunk.kind)?;
-        writeln!(
-            index,
-            "  Lines: {}-{}",
-            chunk.start_line + 1,
-            chunk.end_line + 1
-        )?;
-        if let Some(parent) = &chunk.parent {
-            writeln!(index, "  Parent: {}", parent)?;
-        }
-        writeln!(index, "---")?;
-    }
-
-    println!(
-        "Wrote {} chunks for {}",
-        chunks.len(),
-        source_file.display()
-    );
-    Ok(())
-} 
