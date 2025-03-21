@@ -54,8 +54,23 @@ pub struct Chunker {
     lsp_log_file: String,
 }
 
+fn sanitize_name(s: &str) -> String {
+    let mut r = s
+        .replace("::", "_doublecolon_")
+        .replace("<", "_less_")
+        .replace(">", "_greater_")
+        .replace("/", "_slash_");
+    r.truncate(200);
+    r
+}
+
 impl Chunker {
-    pub fn new(project_dir: String, output_dir: String, clangd_path: String, lsp_log_file: String) -> Self {
+    pub fn new(
+        project_dir: String,
+        output_dir: String,
+        clangd_path: String,
+        lsp_log_file: String,
+    ) -> Self {
         Self {
             project_dir,
             output_dir,
@@ -68,7 +83,12 @@ impl Chunker {
         let mut cpp_files = Vec::new();
 
         for entry in WalkDir::new(&self.project_dir) {
-            let entry = entry.map_err(|e| format!("Failed to read directory entry in '{}': {}", self.project_dir, e))?;
+            let entry = entry.map_err(|e| {
+                format!(
+                    "Failed to read directory entry in '{}': {}",
+                    self.project_dir, e
+                )
+            })?;
             let path = entry.path();
 
             if path.is_file() {
@@ -151,41 +171,39 @@ impl Chunker {
         Ok(chunks)
     }
 
-    fn write_chunks(
-        &self,
-        source_file: &Path,
-        chunks: &[CodeChunk],
-    ) -> Result<(), Box<dyn Error>> {
+    fn write_chunks(&self, source_file: &Path, chunks: &[CodeChunk]) -> Result<(), Box<dyn Error>> {
         // Create a directory for this file's chunks
         let file_stem = source_file
             .file_stem()
             .unwrap_or_default()
             .to_string_lossy();
         let file_chunks_dir = PathBuf::from(&self.output_dir).join(file_stem.to_string());
-        fs::create_dir_all(&file_chunks_dir)
-            .map_err(|e| format!("Failed to create chunks directory '{}': {}", file_chunks_dir.display(), e))?;
+        fs::create_dir_all(&file_chunks_dir).map_err(|e| {
+            format!(
+                "Failed to create chunks directory '{}': {}",
+                file_chunks_dir.display(),
+                e
+            )
+        })?;
 
         // Write index file with metadata about all chunks
-        let mut index = File::create(file_chunks_dir.join("_index.txt"))
-            .map_err(|e| format!("Failed to create index file in '{}': {}", file_chunks_dir.display(), e))?;
+        let mut index = File::create(file_chunks_dir.join("_index.txt")).map_err(|e| {
+            format!(
+                "Failed to create index file in '{}': {}",
+                file_chunks_dir.display(),
+                e
+            )
+        })?;
 
         writeln!(index, "Source file: {}", source_file.display())
             .map_err(|e| format!("Failed to write to index file: {}", e))?;
         writeln!(index, "Number of chunks: {}", chunks.len())
             .map_err(|e| format!("Failed to write to index file: {}", e))?;
-        writeln!(index, "---")
-            .map_err(|e| format!("Failed to write to index file: {}", e))?;
+        writeln!(index, "---").map_err(|e| format!("Failed to write to index file: {}", e))?;
 
         // Write each chunk to a separate file
         for (i, chunk) in chunks.iter().enumerate() {
-            let mut sanitized_name = chunk
-                .name
-                .replace("::", "_")
-                .replace("<", "_")
-                .replace(">", "_");
-            if sanitized_name.len() > 200 {
-                sanitized_name = sanitized_name[..200].to_string();
-            }
+            let sanitized_name = sanitize_name(&chunk.name);
             let chunk_filename = format!(
                 "{:03}_{}_{}_{}.cpp",
                 i + 1,
@@ -195,8 +213,13 @@ impl Chunker {
             );
 
             let chunk_path = file_chunks_dir.join(chunk_filename.clone());
-            fs::write(&chunk_path, &chunk.content)
-                .map_err(|e| format!("Failed to write chunk file '{}': {}", chunk_path.display(), e))?;
+            fs::write(&chunk_path, &chunk.content).map_err(|e| {
+                format!(
+                    "Failed to write chunk file '{}': {}",
+                    chunk_path.display(),
+                    e
+                )
+            })?;
 
             // Add to index
             writeln!(index, "Chunk: {}", chunk_filename)
@@ -216,8 +239,7 @@ impl Chunker {
                 writeln!(index, "  Parent: {}", parent)
                     .map_err(|e| format!("Failed to write to index file: {}", e))?;
             }
-            writeln!(index, "---")
-                .map_err(|e| format!("Failed to write to index file: {}", e))?;
+            writeln!(index, "---").map_err(|e| format!("Failed to write to index file: {}", e))?;
         }
 
         println!(
@@ -230,16 +252,28 @@ impl Chunker {
 
     pub fn run(&self) -> Result<(), Box<dyn Error>> {
         // Create output directory if it doesn't exist
-        fs::create_dir_all(&self.output_dir)
-            .map_err(|e| format!("Failed to create output directory '{}': {}", self.output_dir, e))?;
+        fs::create_dir_all(&self.output_dir).map_err(|e| {
+            format!(
+                "Failed to create output directory '{}': {}",
+                self.output_dir, e
+            )
+        })?;
 
         // Open LSP log file
-        let mut _lsp_log = File::create(&self.lsp_log_file)
-            .map_err(|e| format!("Failed to create LSP log file '{}': {}", self.lsp_log_file, e))?;
+        let mut _lsp_log = File::create(&self.lsp_log_file).map_err(|e| {
+            format!(
+                "Failed to create LSP log file '{}': {}",
+                self.lsp_log_file, e
+            )
+        })?;
 
         // Find all C++ source files in the project
-        let source_files = self.find_cpp_source_files()
-            .map_err(|e| format!("Failed to scan project directory '{}': {}", self.project_dir, e))?;
+        let source_files = self.find_cpp_source_files().map_err(|e| {
+            format!(
+                "Failed to scan project directory '{}': {}",
+                self.project_dir, e
+            )
+        })?;
         println!("Found {} C++ source files", source_files.len());
 
         // Start clangd process
@@ -249,7 +283,12 @@ impl Chunker {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .spawn()
-            .map_err(|e| format!("Failed to start clangd process at '{}': {}", self.clangd_path, e))?;
+            .map_err(|e| {
+                format!(
+                    "Failed to start clangd process at '{}': {}",
+                    self.clangd_path, e
+                )
+            })?;
 
         let mut clangd_stdin = clangd.stdin.take().expect("Failed to open clangd stdin");
         let mut clangd_stdout =
@@ -281,12 +320,10 @@ impl Chunker {
         // Process all source files
         for source_file in source_files {
             println!("Processing file: {}", source_file.display());
-            self.process_file(
-                &source_file,
-                &mut clangd_stdin,
-                &mut clangd_stdout,
-            )
-            .map_err(|e| format!("Failed to process file '{}': {}", source_file.display(), e))?;
+            self.process_file(&source_file, &mut clangd_stdin, &mut clangd_stdout)
+                .map_err(|e| {
+                    format!("Failed to process file '{}': {}", source_file.display(), e)
+                })?;
         }
 
         // Shutdown clangd
@@ -321,7 +358,10 @@ impl Chunker {
         let content_length = request_str.len();
 
         // Create log entry for request
-        let log_entry = format!(">>> Request:\nContent-Length: {}\n\n{}\n", content_length, request_str);
+        let log_entry = format!(
+            ">>> Request:\nContent-Length: {}\n\n{}\n",
+            content_length, request_str
+        );
         if let Ok(mut lsp_log) = File::options().append(true).open(&self.lsp_log_file) {
             write!(lsp_log, "{}", log_entry)
                 .map_err(|e| format!("Failed to write to LSP log file: {}", e))?;
@@ -329,11 +369,11 @@ impl Chunker {
 
         writeln!(stdin, "Content-Length: {}", content_length)
             .map_err(|e| format!("Failed to write Content-Length header: {}", e))?;
-        writeln!(stdin)
-            .map_err(|e| format!("Failed to write header separator: {}", e))?;
+        writeln!(stdin).map_err(|e| format!("Failed to write header separator: {}", e))?;
         write!(stdin, "{}", request_str)
             .map_err(|e| format!("Failed to write request body: {}", e))?;
-        stdin.flush()
+        stdin
+            .flush()
             .map_err(|e| format!("Failed to flush request: {}", e))?;
 
         Ok(())
@@ -348,7 +388,8 @@ impl Chunker {
         let mut headers = String::new();
         loop {
             let mut line = String::new();
-            reader.read_line(&mut line)
+            reader
+                .read_line(&mut line)
                 .map_err(|e| format!("Failed to read LSP response header: {}", e))?;
             let line = line.trim();
 
@@ -364,16 +405,25 @@ impl Chunker {
                     .split(':')
                     .nth(1)
                     .ok_or("Invalid Content-Length header")?;
-                content_length = Some(len_str.trim().parse()
-                    .map_err(|e| format!("Failed to parse Content-Length value '{}': {}", len_str.trim(), e))?);
+                content_length = Some(len_str.trim().parse().map_err(|e| {
+                    format!(
+                        "Failed to parse Content-Length value '{}': {}",
+                        len_str.trim(),
+                        e
+                    )
+                })?);
             }
         }
 
         // Read content
         if let Some(length) = content_length {
             let mut buffer = vec![0; length];
-            reader.read_exact(&mut buffer)
-                .map_err(|e| format!("Failed to read LSP response body of length {}: {}", length, e))?;
+            reader.read_exact(&mut buffer).map_err(|e| {
+                format!(
+                    "Failed to read LSP response body of length {}: {}",
+                    length, e
+                )
+            })?;
 
             let response_str = String::from_utf8_lossy(&buffer);
             let json_value: serde_json::Value = serde_json::from_slice(&buffer)
@@ -400,9 +450,16 @@ impl Chunker {
     ) -> Result<(), Box<dyn Error>> {
         let file_content = fs::read_to_string(file_path)
             .map_err(|e| format!("Failed to read file '{}': {}", file_path.display(), e))?;
-        let file_uri = format!("file://{}", fs::canonicalize(file_path)
-            .map_err(|e| format!("Failed to canonicalize path '{}': {}", file_path.display(), e))?
-            .to_string_lossy());
+        let file_uri = format!(
+            "file://{}",
+            fs::canonicalize(file_path)
+                .map_err(|e| format!(
+                    "Failed to canonicalize path '{}': {}",
+                    file_path.display(),
+                    e
+                ))?
+                .to_string_lossy()
+        );
 
         // Send didOpen notification to tell clangd about the file
         let did_open_notification = json!({
@@ -418,7 +475,13 @@ impl Chunker {
             }
         });
         self.send_lsp_request(clangd_stdin, did_open_notification)
-            .map_err(|e| format!("Failed to send didOpen notification for '{}': {}", file_path.display(), e))?;
+            .map_err(|e| {
+                format!(
+                    "Failed to send didOpen notification for '{}': {}",
+                    file_path.display(),
+                    e
+                )
+            })?;
 
         // Send document symbol request to get the symbols in the file
         let document_symbol_request = json!({
@@ -432,19 +495,42 @@ impl Chunker {
             }
         });
         self.send_lsp_request(clangd_stdin, document_symbol_request)
-            .map_err(|e| format!("Failed to send document symbol request for '{}': {}", file_path.display(), e))?;
+            .map_err(|e| {
+                format!(
+                    "Failed to send document symbol request for '{}': {}",
+                    file_path.display(),
+                    e
+                )
+            })?;
 
         // Read and process clangd's response to extract symbols
-        let symbols = self.read_document_symbols(clangd_stdout)
-            .map_err(|e| format!("Failed to read document symbols for '{}': {}", file_path.display(), e))?;
+        let symbols = self.read_document_symbols(clangd_stdout).map_err(|e| {
+            format!(
+                "Failed to read document symbols for '{}': {}",
+                file_path.display(),
+                e
+            )
+        })?;
 
         // Extract chunks from the file based on the symbols
-        let chunks = self.extract_chunks(file_path, &file_content, &symbols)
-            .map_err(|e| format!("Failed to extract chunks from '{}': {}", file_path.display(), e))?;
+        let chunks = self
+            .extract_chunks(file_path, &file_content, &symbols)
+            .map_err(|e| {
+                format!(
+                    "Failed to extract chunks from '{}': {}",
+                    file_path.display(),
+                    e
+                )
+            })?;
 
         // Write chunks to output files
-        self.write_chunks(file_path, &chunks)
-            .map_err(|e| format!("Failed to write chunks for '{}': {}", file_path.display(), e))?;
+        self.write_chunks(file_path, &chunks).map_err(|e| {
+            format!(
+                "Failed to write chunks for '{}': {}",
+                file_path.display(),
+                e
+            )
+        })?;
 
         Ok(())
     }
@@ -455,26 +541,35 @@ impl Chunker {
     ) -> Result<Vec<Symbol>, Box<dyn Error>> {
         // Keep reading responses until we get the document symbol response
         loop {
-            let response = self.read_lsp_response(stdout)
-                .map_err(|e| format!("Failed to read LSP response while waiting for document symbols: {}", e))?;
+            let response = self.read_lsp_response(stdout).map_err(|e| {
+                format!(
+                    "Failed to read LSP response while waiting for document symbols: {}",
+                    e
+                )
+            })?;
 
             // Check if this is the document symbol response (id: 2)
             if let Some(id) = response.get("id") {
                 if id.as_u64() == Some(2) && response.get("result").is_some() {
-                    return serde_json::from_value(response["result"].clone())
-                        .map_err(|e| Box::new(std::io::Error::new(
+                    return serde_json::from_value(response["result"].clone()).map_err(|e| {
+                        Box::new(std::io::Error::new(
                             std::io::ErrorKind::InvalidData,
-                            format!("Failed to parse document symbols from response: {}", e)
-                        )) as Box<dyn Error>);
+                            format!("Failed to parse document symbols from response: {}", e),
+                        )) as Box<dyn Error>
+                    });
                 }
             }
 
             // For debugging
-            println!(
+            let log_entry = format!(
                 "Got response with id: {:?}, method: {:?}",
                 response.get("id"),
                 response.get("method")
             );
+            if let Ok(mut lsp_log) = File::options().append(true).open(&self.lsp_log_file) {
+                write!(lsp_log, "{}", log_entry)
+                    .map_err(|e| format!("Failed to write to LSP log file: {}", e))?;
+            }
         }
     }
 }
