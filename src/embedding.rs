@@ -1,9 +1,11 @@
-use fastembed::{EmbeddingModel, InitOptions, TextEmbedding};
+use fastembed::TextEmbedding;
 use indicatif::{ProgressBar, ProgressStyle};
 use serde_json::json;
 use std::error::Error;
 use std::fs;
 use walkdir::WalkDir;
+
+use crate::embedding_common::create_embedder;
 
 pub struct Embedder {
     output_dir: String,
@@ -12,34 +14,7 @@ pub struct Embedder {
 
 impl Embedder {
     pub fn new(output_dir: String, model_name: &str) -> Result<Self, Box<dyn Error>> {
-        // Parse the model name into an EmbeddingModel enum
-        let model = match model_name {
-            "BAAI/bge-small-en-v1.5" => EmbeddingModel::BGESmallENV15,
-            "BAAI/bge-base-en-v1.5" => EmbeddingModel::BGEBaseENV15,
-            "BAAI/bge-large-en-v1.5" => EmbeddingModel::BGELargeENV15,
-            "sentence-transformers/all-MiniLM-L6-v2" => EmbeddingModel::AllMiniLML6V2,
-            "sentence-transformers/all-MiniLM-L12-v2" => EmbeddingModel::AllMiniLML12V2,
-            "sentence-transformers/paraphrase-MiniLM-L6-v2" => {
-                EmbeddingModel::ParaphraseMLMiniLML12V2
-            }
-            "sentence-transformers/paraphrase-mpnet-base-v2" => {
-                EmbeddingModel::ParaphraseMLMpnetBaseV2
-            }
-            "nomic-ai/nomic-embed-text-v1" => EmbeddingModel::NomicEmbedTextV1,
-            "nomic-ai/nomic-embed-text-v1.5" => EmbeddingModel::NomicEmbedTextV15,
-            "intfloat/multilingual-e5-small" => EmbeddingModel::MultilingualE5Small,
-            "intfloat/multilingual-e5-base" => EmbeddingModel::MultilingualE5Base,
-            "intfloat/multilingual-e5-large" => EmbeddingModel::MultilingualE5Large,
-            "mixedbread-ai/mxbai-embed-large-v1" => EmbeddingModel::MxbaiEmbedLargeV1,
-            "Alibaba-NLP/gte-base-en-v1.5" => EmbeddingModel::GTEBaseENV15,
-            "Alibaba-NLP/gte-large-en-v1.5" => EmbeddingModel::GTELargeENV15,
-            "Qdrant/clip-ViT-B-32-text" => EmbeddingModel::ClipVitB32,
-            "jinaai/jina-embeddings-v2-base-code" => EmbeddingModel::JinaEmbeddingsV2BaseCode,
-            _ => return Err(format!("Unsupported embedding model: {}", model_name).into()),
-        };
-
-        let options = InitOptions::new(model).with_show_download_progress(true);
-        let text_embedding = TextEmbedding::try_new(options)?;
+        let text_embedding = create_embedder(model_name)?;
         Ok(Self {
             output_dir,
             model: text_embedding,

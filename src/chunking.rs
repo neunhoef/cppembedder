@@ -318,8 +318,12 @@ impl Chunker {
             .map_err(|e| format!("Failed to send LSP initialization request: {}", e))?;
 
         // Process all source files
-        for source_file in source_files {
-            println!("Processing file: {}", source_file.display());
+        let total_nr = source_files.len();
+        for (i, source_file) in source_files.into_iter().enumerate() {
+            println!(
+                "Processing file ({i} / {total_nr}): {}",
+                source_file.display()
+            );
             self.process_file(&source_file, &mut clangd_stdin, &mut clangd_stdout)
                 .map_err(|e| {
                     format!("Failed to process file '{}': {}", source_file.display(), e)

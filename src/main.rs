@@ -3,6 +3,7 @@ use std::error::Error;
 
 mod chunking;
 mod embedding;
+mod embedding_common;
 mod importer;
 
 /// Program to chunk C++ source files based on function/class/method boundaries using clangd
